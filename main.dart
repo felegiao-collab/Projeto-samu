@@ -68,6 +68,9 @@ String _dateKey(DateTime d) =>
 
 DateTime _day(DateTime d) => DateTime(d.year, d.month, d.day);
 
+String _fmt(DateTime d) =>
+    '${d.day.toString().padLeft(2, '0')}/${d.month.toString().padLeft(2, '0')}/${d.year}';
+
 /// Converte dados antigos (alarme em "minutos antes") para hora exata.
 String _minusMinutes(String hhmm, int minutes) {
   final p = hhmm.split(':');
@@ -85,7 +88,7 @@ class PlantaoStore extends ChangeNotifier {
   PlantaoStore._();
   static final instance = PlantaoStore._();
 
-  DateTime startDate = DateTime(2026, 11, 1);
+  DateTime startDate = DateTime(2026, 10, 31); // SAMU em 31/10 => SAMU nos dias pares de novembro
   WorkType firstType = WorkType.samu;
   String samuStart = '19:00';
   String privateStart = '19:00';
@@ -540,12 +543,30 @@ class _HomePageState extends State<HomePage> {
     final alarmS = TextEditingController(text: store.samuAlarm);
     final alarmP = TextEditingController(text: store.privateAlarm);
     var duration = store.durationHours;
+    var startDay = _day(store.startDate);
+    var first = store.firstType;
     if (!mounted) return;
     await showDialog<void>(
       context: context,
       builder: (ctx) => StatefulBuilder(builder: (ctx, setDialog) => AlertDialog(
         title: const Text('Configurar horários e alarmes'),
         content: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
+          OutlinedButton.icon(
+            onPressed: () async {
+              final d = await showDatePicker(context: ctx, initialDate: startDay, firstDate: DateTime(2020), lastDate: DateTime(2035));
+              if (d != null) setDialog(() => startDay = _day(d));
+            },
+            icon: const Icon(Icons.event), label: Text('Início da escala: ${_fmt(startDay)}'),
+          ),
+          DropdownButtonFormField<WorkType>(
+            value: first, decoration: const InputDecoration(labelText: 'Plantão nesse dia de início'),
+            items: const [
+              DropdownMenuItem(value: WorkType.samu, child: Text('SAMU')),
+              DropdownMenuItem(value: WorkType.particular, child: Text('Particular')),
+            ],
+            onChanged: (v) => setDialog(() => first = v ?? first),
+          ),
+          const SizedBox(height: 12),
           TextField(controller: samu, decoration: const InputDecoration(labelText: 'Entrada SAMU (HH:mm)'), keyboardType: TextInputType.datetime),
           TextField(controller: priv, decoration: const InputDecoration(labelText: 'Entrada particular (HH:mm)'), keyboardType: TextInputType.datetime),
           const SizedBox(height: 12),
@@ -570,6 +591,8 @@ class _HomePageState extends State<HomePage> {
               store.samuAlarm = alarmS.text;
               store.privateAlarm = alarmP.text;
               store.durationHours = duration;
+              store.startDate = startDay;
+              store.firstType = first;
               await store.save();
               if (ctx.mounted) Navigator.pop(ctx);
             },
@@ -640,7 +663,7 @@ class _HomePageState extends State<HomePage> {
             if (!before && status != DayStatus.normal)
               Text('Escala do dia: ${type.label}', style: const TextStyle(color: Colors.white70)),
             if (before)
-              const Text('A escala começa em 01/11/2026', style: TextStyle(color: Colors.white70)),
+              Text('A escala começa em ${_fmt(store.startDate)}', style: const TextStyle(color: Colors.white70)),
           ])),
         ]),
         if (normal) ...[
