@@ -95,6 +95,7 @@ class PlantaoStore extends ChangeNotifier {
   final Map<String, DayOverride> overrides = {};
   final List<SwapRecord> swaps = [];
   final Map<String, DayTimes> timeOverrides = {};
+  String? notifError; // última falha ao agendar alarmes (mostrada na tela)
 
   Future<void> load() async {
     final p = await SharedPreferences.getInstance();
@@ -136,8 +137,8 @@ class PlantaoStore extends ChangeNotifier {
       'swaps': swaps.map((e) => e.toJson()).toList(),
       'timeOverrides': timeOverrides.map((k, v) => MapEntry(k, v.toJson())),
     }));
-    notifyListeners();
     await NotificationService.instance.refresh(this);
+    notifyListeners();
   }
 
   WorkType originalType(DateTime date) {
@@ -201,6 +202,21 @@ class PlantaoStore extends ChangeNotifier {
     await save();
   }
 
+  /// Aplica a mesma entrada e hora de alarme a vários dias de uma vez.
+  Future<void> setTimesForDates(Iterable<DateTime> dates, String start, String alarm) async {
+    for (final d in dates) {
+      timeOverrides[_dateKey(d)] = DayTimes(start, alarm);
+    }
+    await save();
+  }
+
+  Future<void> resetTimesForDates(Iterable<DateTime> dates) async {
+    for (final d in dates) {
+      timeOverrides.remove(_dateKey(d));
+    }
+    await save();
+  }
+
   String startFor(WorkType type) => type == WorkType.samu ? samuStart : privateStart;
   String alarmFor(WorkType type) => type == WorkType.samu ? samuAlarm : privateAlarm;
 }
@@ -217,8 +233,21 @@ class NotificationService {
     await androidPlugin?.requestNotificationsPermission();
   }
 
-  Future<void> refresh(PlantaoStore store) async {
-    await plugin.cancelAll();
+  Future<void> _last = Future.value();
+
+  /// Reagenda os alarmes, um refresh por vez (evita corrida entre salvamentos).
+  /// Nunca lança: falhas ficam em store.notifError e viram um aviso na tela.
+  Future<void> refresh(PlantaoStore store) {
+    _last = _last.then((_) => _refresh(store));
+    return _last;
+  }
+
+  Future<void> _refresh(PlantaoStore store) async {
+    try {
+      await plugin.cancelAll();
+    } catch (e) {
+      store.notifError = 'cancelar: $e';
+    }
     final now = DateTime.now();
     // Mantém uma janela móvel de 60 dias de notificações futuras.
     for (var i = 0; i < 60; i++) {
@@ -236,6 +265,7 @@ class NotificationService {
       if (!fireAt.isAfter(now)) continue;
       final scheduled = tz.TZDateTime.from(fireAt, tz.local);
       final id = int.parse('${date.year}${date.month.toString().padLeft(2, '0')}${date.day.toString().padLeft(2, '0')}${type == WorkType.samu ? 1 : 2}');
+      try {
       await plugin.zonedSchedule(
         id,
         'Plantão ${type.label}',
@@ -251,20 +281,30 @@ class NotificationService {
         ),
         androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
       );
+      } catch (e) {
+        store.notifError = 'agendar: $e';
+      }
     }
   }
 }
 
 class PlantaoApp extends StatelessWidget {
   const PlantaoApp({super.key});
+
+  ThemeData _theme(Brightness b) => ThemeData(
+    useMaterial3: true,
+    brightness: b,
+    colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF3F51B5), brightness: b),
+    visualDensity: VisualDensity.standard,
+  );
+
   @override
   Widget build(BuildContext context) => MaterialApp(
     title: 'Controle de Plantão 12/36',
     debugShowCheckedModeBanner: false,
-    theme: ThemeData(
-      useMaterial3: true,
-      colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFFD32F2F)),
-    ),
+    theme: _theme(Brightness.light),
+    darkTheme: _theme(Brightness.dark),
+    themeMode: ThemeMode.system,
     home: const HomePage(),
   );
 }
@@ -291,6 +331,72 @@ class _HomePageState extends State<HomePage> {
 
   void _shiftMonth(int delta) => setState(() => month = DateTime(month.year, month.month + delta));
 
+  static const _weekdays = ['Segunda-feira', 'Terça-feira', 'Quarta-feira', 'Quinta-feira',
+    'Sexta-feira', 'Sábado', 'Domingo'];
+
+  bool selecting = false;
+  final Set<DateTime> picked = {};
+
+  bool _isBeforeStart(DateTime d) => d.isBefore(_day(store.startDate));
+
+  void _exitSelecting() => setState(() { selecting = false; picked.clear(); });
+
+  void _pickType(WorkType t) => setState(() {
+    final n = DateTime(month.year, month.month + 1, 0).day;
+    for (var d = 1; d <= n; d++) {
+      final date = DateTime(month.year, month.month, d);
+      if (!_isBeforeStart(date) && store.effectiveType(date) == t) picked.add(date);
+    }
+  });
+
+  Future<void> _bulkTimes() async {
+    final dates = (picked.toList()..sort()).where((d) => !_isBeforeStart(d)).toList();
+    if (dates.isEmpty) return;
+    final startCtl = TextEditingController(text: store.startOn(dates.first));
+    final alarmCtl = TextEditingController(text: store.alarmOn(dates.first));
+    final samuN = dates.where((d) => store.effectiveType(d) == WorkType.samu).length;
+    final privN = dates.length - samuN;
+    var done = false;
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('${dates.length} dias selecionados'),
+        content: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('SAMU: $samuN  •  Particular: $privN'),
+          const SizedBox(height: 12),
+          TextField(controller: startCtl, decoration: const InputDecoration(labelText: 'Entrada (HH:mm)', border: OutlineInputBorder()), keyboardType: TextInputType.datetime),
+          const SizedBox(height: 12),
+          TextField(controller: alarmCtl, decoration: const InputDecoration(labelText: 'Hora do alarme (HH:mm)', border: OutlineInputBorder()), keyboardType: TextInputType.datetime),
+        ])),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancelar')),
+          TextButton(
+            onPressed: () async {
+              await store.resetTimesForDates(dates);
+              done = true;
+              if (ctx.mounted) Navigator.pop(ctx);
+            },
+            child: const Text('Restaurar padrão'),
+          ),
+          FilledButton(
+            onPressed: () async {
+              if (!_validTime(startCtl.text) || !_validTime(alarmCtl.text)) {
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Informe horários válidos no formato HH:mm.')));
+                return;
+              }
+              await store.setTimesForDates(dates, startCtl.text, alarmCtl.text);
+              done = true;
+              if (ctx.mounted) Navigator.pop(ctx);
+            },
+            child: const Text('Aplicar'),
+          ),
+        ],
+      ),
+    );
+    if (done && mounted) _exitSelecting();
+  }
+
   @override
   void initState() {
     super.initState();
@@ -302,7 +408,18 @@ class _HomePageState extends State<HomePage> {
     store.removeListener(_changed);
     super.dispose();
   }
-  void _changed() { if (mounted) setState(() {}); }
+  void _changed() {
+    if (!mounted) return;
+    setState(() {});
+    final e = store.notifError;
+    if (e != null) {
+      store.notifError = null;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        duration: const Duration(seconds: 8),
+        content: Text('Salvo, mas houve falha nos alarmes ($e)'),
+      ));
+    }
+  }
 
   Future<void> _editDay() async {
     final status = store.overrideFor(selected)?.status ?? DayStatus.normal;
@@ -468,137 +585,226 @@ class _HomePageState extends State<HomePage> {
     return m != null;
   }
 
-  @override
-  Widget build(BuildContext context) {
+  Color _baseColor(DateTime date) {
+    if (_isBeforeStart(date)) return Colors.blueGrey;
+    final st = store.overrideFor(date)?.status ?? DayStatus.normal;
+    if (st == DayStatus.folga) return const Color(0xFF2E7D32);
+    if (st == DayStatus.ausencia) return const Color(0xFFEF6C00);
+    return store.effectiveType(date).color;
+  }
+
+  Widget _heroCard() {
     final type = store.effectiveType(selected);
-    final override = store.overrideFor(selected);
+    final status = store.overrideFor(selected)?.status ?? DayStatus.normal;
+    final note = store.overrideFor(selected)?.note ?? '';
+    final before = _isBeforeStart(selected);
+    final base = _baseColor(selected);
+    final normal = !before && status == DayStatus.normal;
+
     final start = store.startOn(selected);
-    final startParts = start.split(':');
-    final endHour = (int.parse(startParts[0]) + store.durationHours) % 24;
-    final end = '${endHour.toString().padLeft(2, '0')}:${startParts[1]}';
+    final sp = start.split(':');
+    final end = '${((int.parse(sp[0]) + store.durationHours) % 24).toString().padLeft(2, '0')}:${sp[1]}';
+
+    final title = before ? 'Sem escala' : status == DayStatus.folga ? 'Folga' : status == DayStatus.ausencia ? 'Ausência' : type.label;
+    final icon = before ? Icons.hourglass_empty : status == DayStatus.folga ? Icons.beach_access
+        : status == DayStatus.ausencia ? Icons.event_busy : type == WorkType.samu ? Icons.local_hospital : Icons.airport_shuttle;
+    final swapped = !before && type != store.originalType(selected);
+
+    final btnStyle = OutlinedButton.styleFrom(
+      foregroundColor: Colors.white,
+      side: const BorderSide(color: Colors.white54),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+    );
+
+    return Container(
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(begin: Alignment.topLeft, end: Alignment.bottomRight,
+          colors: [base, Color.lerp(base, Colors.black, .3)!]),
+        borderRadius: BorderRadius.circular(28),
+        boxShadow: [BoxShadow(color: base.withValues(alpha: .35), blurRadius: 18, offset: const Offset(0, 8))],
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text('${_weekdays[selected.weekday - 1]}, ${selected.day} de ${_months[selected.month - 1].toLowerCase()}',
+          style: const TextStyle(color: Colors.white70, fontSize: 14)),
+        const SizedBox(height: 10),
+        Row(children: [
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(color: Colors.white.withValues(alpha: .2), borderRadius: BorderRadius.circular(16)),
+            child: Icon(icon, color: Colors.white, size: 30),
+          ),
+          const SizedBox(width: 14),
+          Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(title, style: const TextStyle(color: Colors.white, fontSize: 30, fontWeight: FontWeight.w800, height: 1.1)),
+            if (!before && status != DayStatus.normal)
+              Text('Escala do dia: ${type.label}', style: const TextStyle(color: Colors.white70)),
+            if (before)
+              const Text('A escala começa em 01/11/2026', style: TextStyle(color: Colors.white70)),
+          ])),
+        ]),
+        if (normal) ...[
+          const SizedBox(height: 16),
+          Wrap(spacing: 8, runSpacing: 8, children: [
+            _Pill(icon: Icons.schedule, text: '$start – $end'),
+            _Pill(icon: Icons.alarm, text: 'Alarme ${store.alarmOn(selected)}${store.hasTimeOverride(selected) ? ' •  só este dia' : ''}'),
+            if (swapped) _Pill(icon: Icons.swap_horiz, text: 'Troca (original: ${store.originalType(selected).label})'),
+          ]),
+        ],
+        if (note.isNotEmpty) ...[
+          const SizedBox(height: 10),
+          Text(note, style: const TextStyle(color: Colors.white, fontStyle: FontStyle.italic)),
+        ],
+        const SizedBox(height: 16),
+        Wrap(spacing: 8, runSpacing: 8, children: [
+          OutlinedButton.icon(style: btnStyle, onPressed: before ? null : _editTimes, icon: const Icon(Icons.alarm, size: 18), label: const Text('Horário')),
+          OutlinedButton.icon(style: btnStyle, onPressed: before ? null : _editDay, icon: const Icon(Icons.edit_calendar, size: 18), label: const Text('Folga / ausência')),
+          OutlinedButton.icon(style: btnStyle, onPressed: before ? null : _swap, icon: const Icon(Icons.swap_horiz, size: 18), label: const Text('Trocar')),
+        ]),
+      ]),
+    );
+  }
+
+  Widget _calendarCard() {
+    final cs = Theme.of(context).colorScheme;
     final firstWeekday = DateTime(month.year, month.month, 1).weekday % 7;
     final daysInMonth = DateTime(month.year, month.month + 1, 0).day;
     final cells = ((firstWeekday + daysInMonth + 6) ~/ 7) * 7;
-    final beforeStart = _day(selected).isBefore(_day(store.startDate));
-    return Scaffold(
-      appBar: AppBar(
-        title: const Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text('Plantão 12/36', style: TextStyle(fontWeight: FontWeight.bold)),
-          Text('SAMU & Particular', style: TextStyle(fontSize: 12)),
+    final today = _day(DateTime.now());
+
+    return Container(
+      padding: const EdgeInsets.fromLTRB(12, 12, 12, 16),
+      decoration: BoxDecoration(color: cs.surfaceContainerLow, borderRadius: BorderRadius.circular(28)),
+      child: Column(children: [
+        Row(children: [
+          IconButton(onPressed: () => _shiftMonth(-1), icon: const Icon(Icons.chevron_left), tooltip: 'Mês anterior'),
+          Expanded(child: Text('${_months[month.month - 1]} ${month.year}',
+            textAlign: TextAlign.center, style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700))),
+          IconButton(onPressed: () => _shiftMonth(1), icon: const Icon(Icons.chevron_right), tooltip: 'Próximo mês'),
+          IconButton.filledTonal(
+            onPressed: () => selecting ? _exitSelecting() : setState(() => selecting = true),
+            icon: Icon(selecting ? Icons.close : Icons.checklist),
+            tooltip: selecting ? 'Cancelar seleção' : 'Selecionar vários dias',
+          ),
         ]),
-        actions: [
-          IconButton(onPressed: _settings, icon: const Icon(Icons.notifications_active_outlined), tooltip: 'Horários e alarmes'),
+        if (selecting) ...[
+          const SizedBox(height: 4),
+          Text(picked.isEmpty ? 'Toque nos dias para marcar' : '${picked.length} dia(s) marcado(s)',
+            style: TextStyle(color: cs.primary, fontWeight: FontWeight.w600)),
+          const SizedBox(height: 8),
+          Wrap(spacing: 8, runSpacing: 4, alignment: WrapAlignment.center, children: [
+            ActionChip(avatar: const Icon(Icons.circle, size: 12, color: Color(0xFFD32F2F)), label: const Text('Todos SAMU'), onPressed: () => _pickType(WorkType.samu)),
+            ActionChip(avatar: const Icon(Icons.circle, size: 12, color: Color(0xFF1976D2)), label: const Text('Todos particular'), onPressed: () => _pickType(WorkType.particular)),
+            ActionChip(avatar: const Icon(Icons.clear_all, size: 16), label: const Text('Limpar'), onPressed: () => setState(picked.clear)),
+          ]),
         ],
-      ),
-      body: ListView(padding: const EdgeInsets.all(16), children: [
-        Card(
-          color: Theme.of(context).colorScheme.secondaryContainer,
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Row(children: [
-                IconButton(onPressed: () => _shiftMonth(-1), icon: const Icon(Icons.chevron_left), tooltip: 'Mês anterior'),
-                Expanded(child: Text('${_months[month.month - 1].toUpperCase()} ${month.year}',
-                    textAlign: TextAlign.center, style: Theme.of(context).textTheme.titleLarge)),
-                IconButton(onPressed: () => _shiftMonth(1), icon: const Icon(Icons.chevron_right), tooltip: 'Próximo mês'),
-              ]),
-              const SizedBox(height: 4),
-              const Text('Alternância diária • início em 01/11/2026 com SAMU'),
-              const SizedBox(height: 16),
-              Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: const [
-                _WeekLabel('D'), _WeekLabel('S'), _WeekLabel('T'), _WeekLabel('Q'),
-                _WeekLabel('Q'), _WeekLabel('S'), _WeekLabel('S'),
-              ]),
-              const SizedBox(height: 8),
-              GridView.builder(
-                shrinkWrap: true, physics: const NeverScrollableScrollPhysics(),
-                itemCount: cells,
-                gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 7, mainAxisSpacing: 5, crossAxisSpacing: 5),
-                itemBuilder: (context, index) {
-                  final day = index - firstWeekday + 1;
-                  if (day < 1 || day > daysInMonth) return const SizedBox.shrink();
-                  final date = DateTime(month.year, month.month, day);
-                  final t = store.effectiveType(date);
-                  final o = store.overrideFor(date);
-                  final selectedDay = date == _day(selected);
-                  final pre = date.isBefore(_day(store.startDate));
-                  final color = pre ? Colors.grey :
-                    o?.status == DayStatus.folga ? Colors.green :
-                    o?.status == DayStatus.ausencia ? Colors.orange : t.color;
-                  return InkWell(
-                    borderRadius: BorderRadius.circular(12),
-                    onTap: () => setState(() => selected = date),
-                    child: Container(
-                      decoration: BoxDecoration(
-                        color: selectedDay ? color.withValues(alpha: .18) : null,
-                        border: Border.all(color: selectedDay ? color : Colors.transparent, width: 2),
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-                        Text('$day', style: TextStyle(fontWeight: FontWeight.bold, color: color)),
-                        Container(width: 7, height: 7, decoration: BoxDecoration(color: color, shape: BoxShape.circle)),
-                      ]),
-                    ),
-                  );
-                },
+        const SizedBox(height: 10),
+        Row(children: [
+          for (final l in const ['D', 'S', 'T', 'Q', 'Q', 'S', 'S'])
+            Expanded(child: Center(child: Text(l, style: TextStyle(fontWeight: FontWeight.w700, color: cs.onSurfaceVariant)))),
+        ]),
+        const SizedBox(height: 6),
+        GridView.builder(
+          shrinkWrap: true, physics: const NeverScrollableScrollPhysics(),
+          itemCount: cells,
+          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 7, mainAxisSpacing: 6, crossAxisSpacing: 6),
+          itemBuilder: (context, index) {
+            final day = index - firstWeekday + 1;
+            if (day < 1 || day > daysInMonth) return const SizedBox.shrink();
+            final date = DateTime(month.year, month.month, day);
+            final pre = _isBeforeStart(date);
+            final color = _baseColor(date);
+            final isSel = selecting ? picked.contains(date) : date == _day(selected);
+            final custom = !pre && store.hasTimeOverride(date);
+            return InkWell(
+              borderRadius: BorderRadius.circular(14),
+              onTap: (pre && selecting) ? null : () => setState(() {
+                selected = date;
+                if (selecting && !picked.remove(date)) picked.add(date);
+              }),
+              onLongPress: pre ? null : () => setState(() {
+                selecting = true;
+                selected = date;
+                picked.add(date);
+              }),
+              child: Container(
+                decoration: BoxDecoration(
+                  color: isSel ? color : (pre ? Colors.transparent : color.withValues(alpha: .15)),
+                  borderRadius: BorderRadius.circular(14),
+                  border: date == today ? Border.all(color: cs.onSurface, width: 1.8) : null,
+                ),
+                child: Stack(alignment: Alignment.center, children: [
+                  Text('$day', style: TextStyle(
+                    fontWeight: FontWeight.w700,
+                    color: isSel ? Colors.white : (pre ? cs.onSurface.withValues(alpha: .35) : color))),
+                  if (custom)
+                    Positioned(bottom: 4, child: Icon(Icons.alarm, size: 10, color: isSel ? Colors.white : color)),
+                  if (selecting && isSel)
+                    const Positioned(top: 2, right: 2, child: Icon(Icons.check_circle, size: 13, color: Colors.white)),
+                ]),
               ),
-              const SizedBox(height: 10),
-              const Wrap(spacing: 12, runSpacing: 8, children: [
-                _Legend(color: Color(0xFFD32F2F), label: 'SAMU'),
-                _Legend(color: Color(0xFF1976D2), label: 'Particular'),
-                _Legend(color: Colors.green, label: 'Folga'),
-                _Legend(color: Colors.orange, label: 'Ausência'),
-              ]),
-            ]),
-          ),
+            );
+          },
         ),
-        const SizedBox(height: 12),
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text('Dia ${selected.day.toString().padLeft(2, '0')}/${selected.month.toString().padLeft(2, '0')}/${selected.year}', style: Theme.of(context).textTheme.titleMedium),
-              const SizedBox(height: 10),
-              Row(children: [
-                CircleAvatar(backgroundColor: type.color.withValues(alpha: .15), child: Icon(type == WorkType.samu ? Icons.local_hospital : Icons.airport_shuttle, color: type.color)),
-                const SizedBox(width: 12),
-                Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Text(type.label, style: TextStyle(fontWeight: FontWeight.bold, color: type.color, fontSize: 18)),
-                  Text('Escala original: ${store.originalType(selected).label}', style: Theme.of(context).textTheme.bodySmall),
-                ])),
-                Chip(label: Text(beforeStart ? 'Antes do início' : override?.status == DayStatus.folga ? 'Folga' : override?.status == DayStatus.ausencia ? 'Ausência' : 'Programado')),
-              ]),
-              const SizedBox(height: 12),
-              if (beforeStart) const Text('A escala só começa em 01/11/2026.', style: TextStyle(fontStyle: FontStyle.italic)),
-              Text('Horário: $start às $end'),
-              Text('Alarme: às ${store.alarmOn(selected)}${store.hasTimeOverride(selected) ? ' (ajustado só neste dia)' : ''}'),
-              if (override?.note.isNotEmpty == true) Text('Observação: ${override!.note}'),
-              const SizedBox(height: 14),
-              Wrap(spacing: 8, runSpacing: 8, children: [
-                OutlinedButton.icon(onPressed: _editTimes, icon: const Icon(Icons.alarm), label: const Text('Horário / alarme')),
-                OutlinedButton.icon(onPressed: _editDay, icon: const Icon(Icons.edit_calendar), label: const Text('Folga / ausência')),
-                FilledButton.icon(onPressed: _swap, icon: const Icon(Icons.swap_horiz), label: const Text('Trocar plantões')),
-              ]),
-            ]),
-          ),
-        ),
-        const SizedBox(height: 8),
-        Card(child: ListTile(
-          leading: const Icon(Icons.save_outlined),
-          title: const Text('Dados salvos no aparelho'),
-          subtitle: const Text('Regras, folgas, ausências e trocas ficam armazenadas localmente.'),
-          trailing: IconButton(onPressed: _settings, icon: const Icon(Icons.settings)),
-        )),
+        const SizedBox(height: 14),
+        const Wrap(spacing: 14, runSpacing: 6, children: [
+          _Legend(color: Color(0xFFD32F2F), label: 'SAMU'),
+          _Legend(color: Color(0xFF1976D2), label: 'Particular'),
+          _Legend(color: Color(0xFF2E7D32), label: 'Folga'),
+          _Legend(color: Color(0xFFEF6C00), label: 'Ausência'),
+        ]),
+        const SizedBox(height: 6),
+        Text('Segure um dia para selecionar vários • ⏰ = horário próprio',
+          style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
       ]),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Scaffold(
+      floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
+      floatingActionButton: selecting
+          ? FloatingActionButton.extended(
+              onPressed: picked.isEmpty ? null : _bulkTimes,
+              icon: const Icon(Icons.alarm_add),
+              label: Text(picked.isEmpty ? 'Marque os dias' : 'Definir horário (${picked.length})'),
+            )
+          : null,
+      body: SafeArea(
+        child: ListView(padding: const EdgeInsets.fromLTRB(16, 12, 16, 110), children: [
+          Row(children: [
+            Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('Plantão 12/36', style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w800)),
+              Text('SAMU & Particular', style: TextStyle(color: cs.onSurfaceVariant)),
+            ])),
+            IconButton.filledTonal(onPressed: _settings, icon: const Icon(Icons.tune), tooltip: 'Horários padrão'),
+          ]),
+          const SizedBox(height: 16),
+          _heroCard(),
+          const SizedBox(height: 16),
+          _calendarCard(),
+        ]),
+      ),
     );
   }
 }
 
-class _WeekLabel extends StatelessWidget {
-  final String label;
-  const _WeekLabel(this.label);
+class _Pill extends StatelessWidget {
+  final IconData icon;
+  final String text;
+  const _Pill({required this.icon, required this.text});
   @override
-  Widget build(BuildContext context) => SizedBox(width: 30, child: Center(child: Text(label, style: const TextStyle(fontWeight: FontWeight.bold))));
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+    decoration: BoxDecoration(color: Colors.white.withValues(alpha: .2), borderRadius: BorderRadius.circular(14)),
+    child: Row(mainAxisSize: MainAxisSize.min, children: [
+      Icon(icon, size: 16, color: Colors.white),
+      const SizedBox(width: 6),
+      Text(text, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
+    ]),
+  );
 }
 
 class _Legend extends StatelessWidget {
@@ -607,7 +813,7 @@ class _Legend extends StatelessWidget {
   const _Legend({required this.color, required this.label});
   @override
   Widget build(BuildContext context) => Row(mainAxisSize: MainAxisSize.min, children: [
-    Container(width: 9, height: 9, decoration: BoxDecoration(color: color, shape: BoxShape.circle)),
+    Container(width: 10, height: 10, decoration: BoxDecoration(color: color, shape: BoxShape.circle)),
     const SizedBox(width: 5), Text(label, style: Theme.of(context).textTheme.bodySmall),
   ]);
 }
