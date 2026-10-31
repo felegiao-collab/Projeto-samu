@@ -72,6 +72,9 @@ jobs:
               s = re.sub(r"(compileOptions\s*\{)", r"\1\n        " + flag, s, count=1)
           else:
               s = re.sub(r"(android\s*\{)", r"\1\n    compileOptions {\n        " + flag + "\n    }", s, count=1)
+          mini = ("isMinifyEnabled = false\n            isShrinkResources = false" if is_kts else "minifyEnabled false\n            shrinkResources false")
+          if re.search(r"release\s*\{", s):
+              s = re.sub(r"(release\s*\{)", lambda m: m.group(1) + "\n            " + mini, s, count=1)
           lib = "com.android.tools:desugar_jdk_libs:2.1.4"
           s += ('\ndependencies {\n    coreLibraryDesugaring("%s")\n}\n' if is_kts else "\ndependencies {\n    coreLibraryDesugaring '%s'\n}\n") % lib
           open(path, "w", encoding="utf-8").write(s)
