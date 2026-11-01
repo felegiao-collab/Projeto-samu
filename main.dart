@@ -236,6 +236,37 @@ class NotificationService {
     await androidPlugin?.requestNotificationsPermission();
   }
 
+  static const _details = NotificationDetails(
+    android: AndroidNotificationDetails(
+      'plantao_alertas', 'Alertas de plantão',
+      channelDescription: 'Lembretes de início dos plantões',
+      importance: Importance.max,
+      priority: Priority.high,
+    ),
+  );
+
+  AndroidFlutterLocalNotificationsPlugin? get _android =>
+      plugin.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+
+  /// Notificação imediata. Retorna false se as notificações estiverem bloqueadas.
+  Future<bool> testNow() async {
+    final enabled = await _android?.areNotificationsEnabled();
+    if (enabled == false) {
+      await _android?.requestNotificationsPermission();
+      return false;
+    }
+    await plugin.show(999000001, 'Teste de notificação', 'Se você viu isto, as notificações funcionam.', _details);
+    return true;
+  }
+
+  Future<void> testIn(int seconds) async {
+    final at = tz.TZDateTime.from(DateTime.now().add(Duration(seconds: seconds)), tz.local);
+    await plugin.zonedSchedule(999000002, 'Teste de alarme agendado', 'O agendamento funciona.', at, _details,
+      androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle);
+  }
+
+  Future<List<PendingNotificationRequest>> pending() => plugin.pendingNotificationRequests();
+
   Future<void> _last = Future.value();
 
   /// Reagenda os alarmes, um refresh por vez (evita corrida entre salvamentos).
@@ -501,6 +532,36 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  Future<void> _runNotifTest(String kind) async {
+    String msg;
+    try {
+      final n = NotificationService.instance;
+      if (kind == 'now') {
+        msg = await n.testNow()
+            ? 'Notificação enviada. Se não apareceu, veja o painel de notificações.'
+            : 'As notificações do app estão BLOQUEADAS. Libere em Configurações do Android → Apps → Controle de Plantão → Notificações.';
+      } else if (kind == 'min') {
+        await n.testIn(60);
+        msg = 'Teste agendado para daqui a 1 minuto. Bloqueie a tela e aguarde.';
+      } else {
+        final list = (await n.pending()).where((r) => r.id < 300000000).toList()
+          ..sort((a, b) => a.id.compareTo(b.id));
+        if (list.isEmpty) {
+          msg = 'Nenhum alarme agendado. Confira o início da escala e se os horários estão no futuro.';
+        } else {
+          final id = list.first.id.toString();
+          msg = '${list.length} alarmes agendados. Próximo: ${id.substring(6, 8)}/${id.substring(4, 6)} '
+              '(${id.endsWith('1') ? 'SAMU' : 'Particular'}) – ${list.first.body}';
+        }
+      }
+    } catch (e) {
+      msg = 'Erro: $e';
+    }
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg), duration: const Duration(seconds: 12)));
+    }
+  }
+
   Future<void> _swap() async {
     DateTime other = selected.add(const Duration(days: 1));
     final colleague = TextEditingController();
@@ -577,6 +638,12 @@ class _HomePageState extends State<HomePage> {
             items: [6, 8, 12, 24].map((v) => DropdownMenuItem(value: v, child: Text('$v horas'))).toList(),
             onChanged: (v) => setDialog(() => duration = v ?? duration),
           ),
+          const Divider(height: 28),
+          Wrap(spacing: 4, runSpacing: 0, children: [
+            TextButton.icon(onPressed: () { Navigator.pop(ctx); _runNotifTest('now'); }, icon: const Icon(Icons.notifications_active, size: 18), label: const Text('Testar agora')),
+            TextButton.icon(onPressed: () { Navigator.pop(ctx); _runNotifTest('min'); }, icon: const Icon(Icons.timer, size: 18), label: const Text('Testar em 1 min')),
+            TextButton.icon(onPressed: () { Navigator.pop(ctx); _runNotifTest('list'); }, icon: const Icon(Icons.list_alt, size: 18), label: const Text('Ver agendados')),
+          ]),
         ])),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancelar')),
