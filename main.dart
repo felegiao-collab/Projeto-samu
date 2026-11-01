@@ -903,7 +903,7 @@ class _HomePageState extends State<HomePage> {
           Row(children: [
             Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Text('Plantão 12/36', style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w800)),
-              Text('SAMU & Particular', style: TextStyle(color: cs.onSurfaceVariant)),
+              Text('SAMU & Particular  •  versão alarme-2026.11.01', style: TextStyle(color: cs.onSurfaceVariant, fontSize: 12)),
             ])),
             IconButton.filledTonal(onPressed: _settings, icon: const Icon(Icons.tune), tooltip: 'Horários padrão'),
           ]),
