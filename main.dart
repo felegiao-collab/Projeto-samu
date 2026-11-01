@@ -1,10 +1,15 @@
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:timezone/data/latest.dart' as tz;
 import 'package:timezone/timezone.dart' as tz;
+
+/// Necessário para os botões da notificação (ex.: "Desligar") sem abrir o app.
+@pragma('vm:entry-point')
+void notificationTapBackground(NotificationResponse response) {}
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -231,19 +236,65 @@ class NotificationService {
 
   Future<void> initialize() async {
     const android = AndroidInitializationSettings('@mipmap/ic_launcher');
-    await plugin.initialize(const InitializationSettings(android: android));
+    await plugin.initialize(
+      const InitializationSettings(android: android),
+      onDidReceiveBackgroundNotificationResponse: notificationTapBackground,
+    );
     final androidPlugin = plugin.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
     await androidPlugin?.requestNotificationsPermission();
+    // Canal de alarme: toca o som de ALARME padrão do celular, no volume de alarme.
+    await androidPlugin?.deleteNotificationChannel('plantao_alertas');
+    await androidPlugin?.createNotificationChannel(const AndroidNotificationChannel(
+      _channelId, 'Alarme de plantão',
+      description: 'Toca o alarme padrão do celular no horário do plantão',
+      importance: Importance.max,
+      playSound: true,
+      sound: UriAndroidNotificationSound(_alarmUri),
+      audioAttributesUsage: AudioAttributesUsage.alarm,
+      enableVibration: true,
+    ));
+    // Alarmes exatos (Android 12+): pede só se ainda não estiver liberado.
+    try {
+      if (await androidPlugin?.canScheduleExactNotifications() == false) {
+        await androidPlugin?.requestExactAlarmsPermission();
+      }
+    } catch (_) {}
   }
 
-  static const _details = NotificationDetails(
+  static const _channelId = 'plantao_alarme';
+  static const _alarmUri = 'content://settings/system/alarm_alert';
+
+  static final _details = NotificationDetails(
     android: AndroidNotificationDetails(
-      'plantao_alertas', 'Alertas de plantão',
-      channelDescription: 'Lembretes de início dos plantões',
+      _channelId, 'Alarme de plantão',
+      channelDescription: 'Toca o alarme padrão do celular no horário do plantão',
       importance: Importance.max,
-      priority: Priority.high,
+      priority: Priority.max,
+      category: AndroidNotificationCategory.alarm,
+      playSound: true,
+      sound: const UriAndroidNotificationSound(_alarmUri),
+      audioAttributesUsage: AudioAttributesUsage.alarm,
+      enableVibration: true,
+      fullScreenIntent: true,
+      visibility: NotificationVisibility.public,
+      timeoutAfter: 120000, // para sozinho depois de 2 min
+      additionalFlags: Int32List.fromList(<int>[4]), // FLAG_INSISTENT: repete o som até desligar
+      actions: const <AndroidNotificationAction>[
+        AndroidNotificationAction('stop', 'Desligar', cancelNotification: true),
+      ],
     ),
   );
+
+  /// Tenta alarme exato; sem permissão, cai para o modo inexato.
+  Future<void> _schedule(int id, String title, String body, tz.TZDateTime at) async {
+    try {
+      await plugin.zonedSchedule(id, title, body, at, _details,
+        androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle);
+    } catch (_) {
+      await plugin.zonedSchedule(id, title, body, at, _details,
+        androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle);
+    }
+  }
 
   AndroidFlutterLocalNotificationsPlugin? get _android =>
       plugin.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
@@ -261,8 +312,7 @@ class NotificationService {
 
   Future<void> testIn(int seconds) async {
     final at = tz.TZDateTime.from(DateTime.now().add(Duration(seconds: seconds)), tz.local);
-    await plugin.zonedSchedule(999000002, 'Teste de alarme agendado', 'O agendamento funciona.', at, _details,
-      androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle);
+    await _schedule(999000002, 'Teste de alarme agendado', 'O agendamento funciona.', at);
   }
 
   Future<List<PendingNotificationRequest>> pending() => plugin.pendingNotificationRequests();
@@ -300,21 +350,7 @@ class NotificationService {
       final scheduled = tz.TZDateTime.from(fireAt, tz.local);
       final id = int.parse('${date.year}${date.month.toString().padLeft(2, '0')}${date.day.toString().padLeft(2, '0')}${type == WorkType.samu ? 1 : 2}');
       try {
-      await plugin.zonedSchedule(
-        id,
-        'Plantão ${type.label}',
-        'Seu plantão começa às ${store.startOn(date)}.',
-        scheduled,
-        const NotificationDetails(
-          android: AndroidNotificationDetails(
-            'plantao_alertas', 'Alertas de plantão',
-            channelDescription: 'Lembretes de início dos plantões',
-            importance: Importance.max,
-            priority: Priority.high,
-          ),
-        ),
-        androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
-      );
+        await _schedule(id, 'Plantão ${type.label}', 'Seu plantão começa às ${store.startOn(date)}.', scheduled);
       } catch (e) {
         store.notifError = 'agendar: $e';
       }
