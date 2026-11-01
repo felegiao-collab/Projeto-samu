@@ -14,6 +14,10 @@ jobs:
       - name: Preparar arquivos
         run: |
           # aceita main.dart na raiz (envio pelo celular) ou em lib/
+          if [ -f main.dart ] && [ -f lib/main.dart ] && ! cmp -s main.dart lib/main.dart; then
+            echo "::error::Existem DOIS main.dart diferentes (um na raiz e outro em lib/). Apague um deles e deixe só o mais novo."
+            exit 1
+          fi
           if [ -f main.dart ]; then mkdir -p lib && mv main.dart lib/main.dart; fi
           test -f lib/main.dart && test -f pubspec.yaml
           cp pubspec.yaml /tmp/pubspec.bak
